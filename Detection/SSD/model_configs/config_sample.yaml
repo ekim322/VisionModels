@@ -1,0 +1,10 @@
+exp_name: 'test_ssd'
+lr: 0.001
+epochs: 500
+batch_size: 4
+batch_accum: 8
+
+img_folder_train: 'goKart_data/train_imgs'
+label_path_train: 'goKart_data/train_labels.json'
+img_folder_val: 'goKart_data/val_imgs'
+label_path_val: 'goKart_data/val_labels.json'
