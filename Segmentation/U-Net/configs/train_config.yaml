@@ -1,0 +1,25 @@
+exp_name: 'unet_test'
+lr: 0.0001
+wd: 0.00001
+
+epochs: 1000
+batch_size: 4
+batch_accum: 8
+patience: 30
+
+img_size: 512
+img_rgb: False
+
+train_img_dir: 'data/train/images'
+val_img_dir: 'data/test/images'
+test_img_dir: 
+
+train_mask_dir: 'data/train/masks'
+val_mask_dir: 'data/test/masks'
+test_mask_dir: 
+
+model_save_dir: 'saved_weight'
+model_load_path: 
+
+num_classes: 151
+mixed_precision: True
