@@ -15,7 +15,7 @@ device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 def get_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--config', '-c', default='configs/train_config.yaml', type=str)
+    parser.add_argument('--config', '-c', default='configs/nuc_train_config.yaml', type=str)
 
     return parser.parse_args()
 
@@ -27,8 +27,14 @@ def train_step(model, optimizer, grad_scaler, loss_fn, dataloader, epoch, cfg, w
     data_loop = tqdm(enumerate(dataloader), total=len(dataloader), leave=False)
     for i, data in data_loop:
         images = data['images'].to(device=device, dtype=torch.float32)
-        masks = data['masks'].to(device=device, dtype=torch.long)
+        if model.n_classes==1: # If single class, use BCELoss -> target needs to be float if input is float
+            masks = data['masks'].to(device=device, dtype=torch.float32)
+        else:
+            masks = data['masks'].to(device=device, dtype=torch.long)
         
+        if model.n_classes==1: # If single class expand dimension 
+            masks = masks.unsqueeze(1)
+
         # Use mixed precision
         with torch.cuda.amp.autocast(enabled=cfg['mixed_precision']):
             masks_preds = model(images)
@@ -62,7 +68,13 @@ def eval_step(model, loss_fn, dataloader, epoch, cfg, writer, eval_type='val'):
     data_loop = tqdm(enumerate(dataloader), total=len(dataloader), leave=False)
     for i, data in data_loop:
         images = data['images'].to(device=device, dtype=torch.float32)
-        masks = data['masks'].to(device=device, dtype=torch.long)
+        if model.n_classes==1: # If single class, use BCELoss -> target needs to be float if input is float
+            masks = data['masks'].to(device=device, dtype=torch.float32)
+        else:
+            masks = data['masks'].to(device=device, dtype=torch.long)
+
+        if model.n_classes==1: # If single class expand dimension 
+            masks = masks.unsqueeze(1)
 
         with torch.no_grad():
             masks_preds = model(images)
@@ -91,6 +103,7 @@ def train_model(model, cfg):
         train_dataloader = UNET_DataLoader(cfg['train_img_dir'], cfg['train_mask_dir'], cfg['batch_size'], cfg['img_size'])
         val_dataloader = UNET_DataLoader(cfg['val_img_dir'], cfg['val_mask_dir'], cfg['batch_size'], cfg['img_size'])
     else: # Split train set  to train/val
+        print("Splitting training and validation set")
         train_dataloader, val_dataloader = UNET_DataLoader(cfg['train_img_dir'], cfg['train_mask_dir'], cfg['batch_size'], cfg['img_size'], split_ratio=0.1)
 
     # Load test set if exist
@@ -110,7 +123,8 @@ def train_model(model, cfg):
         betas = (0.9, 0.999),
         weight_decay=cfg['wd']
     )
-    loss_fn = torch.nn.CrossEntropyLoss()
+    # loss_fn = torch.nn.CrossEntropyLoss()
+    loss_fn = torch.nn.BCEWithLogitsLoss()
     writer = SummaryWriter(os.path.join('logs', cfg['exp_name']))
     grad_scaler = torch.cuda.amp.GradScaler()
 
@@ -124,8 +138,10 @@ def train_model(model, cfg):
         train_loss = train_step(model, optimizer, grad_scaler, loss_fn, train_dataloader, epoch, cfg, writer)
         val_loss = eval_step(model, loss_fn, val_dataloader, epoch, cfg, writer, eval_type='val')
 
+        print("Epoch {} - Train Loss: {} - Val Loss: {}".format(epoch, train_loss, val_loss))
+
         if check_config_key(cfg, 'test_img_dir'):
-            test_loss = eval_step(model, loss_fn, val_dataloader, epoch, cfg, writer, eval_type='test')
+            test_loss = eval_step(model, loss_fn, test_dataloader, epoch, cfg, writer, eval_type='test')
             if test_loss<best_test_loss:
                 torch.save(model.state_dict(), TEST_SAVE_PATH)
         
@@ -139,7 +155,7 @@ def train_model(model, cfg):
             if patience_counter >= cfg['patience']:
                 print("Early stopping at epoch {}".format(epoch))
                 break
-    
+                
     return
 
 if __name__=='__main__':

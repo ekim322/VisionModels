@@ -9,6 +9,8 @@ from torch.utils.data import Dataset
 
 import albumentations as A
 
+from utils.utils_fn import np_to_tensor
+
 def UNET_DataLoader(img_dir, mask_dir, batch_size, img_size, split_ratio=0):
     """
     If split ratio is 0 - return dataset 
@@ -18,7 +20,8 @@ def UNET_DataLoader(img_dir, mask_dir, batch_size, img_size, split_ratio=0):
         A.Resize(width=img_size, height=img_size)
     ])
 
-    dataset = UNET_Dataset(img_dir, mask_dir, transform)
+    # dataset = UNET_Dataset(img_dir, mask_dir, transform)
+    dataset = Nucleus_Dataset(img_dir, transform)
     if split_ratio==False:
         ds_sampler = torch.utils.data.RandomSampler(dataset)
         batch_sampler = torch.utils.data.BatchSampler(ds_sampler, batch_size, drop_last=False)
@@ -81,18 +84,6 @@ class UNET_Dataset(Dataset):
             unique_classes.update(np.unique(mask))
         return len(unique_classes)
     
-    def np_to_tensor(self, image, is_mask):
-        """
-        Process numpy array to be input to model
-        """
-        if is_mask:
-            img = torch.as_tensor(image).long()
-        else:
-            img = image / np.max(image)
-            img = np.transpose(image, (2,0,1))
-            img = torch.as_tensor(img).float()
-        return img
-
     def __getitem__(self, idx):
         img_path = self.img_paths[idx]
         mask_path = self.mask_paths[idx]
@@ -101,14 +92,57 @@ class UNET_Dataset(Dataset):
         else:
             image = np.array(Image.open(img_path).convert("L"))
             image = np.expand_dims(image, axis=-1)
-        image = image/np.max(image)
         mask = np.array(Image.open(mask_path).convert("L"), dtype=np.float32) # Gray scale
+        image = image/np.max(image)
+        if len(np.unique(mask))==2:
+            mask = mask/np.max(mask)
 
         augmentations = self.transfrom(image=image, mask=mask)
         image = augmentations['image']
         mask = augmentations['mask']
 
-        image = self.np_to_tensor(image, is_mask=False)
-        mask = self.np_to_tensor(mask, is_mask=True)
+        image = np_to_tensor(image, is_mask=False)
+        mask = np_to_tensor(mask, is_mask=True)
+
+        return {'images':image.contiguous(), 'masks':mask.contiguous()}
+
+class Nucleus_Dataset(Dataset):
+    """
+    Define img_paths, mask_paths based on dataset
+        - each paths 
+    """
+    def __init__(self, img_dir, transform=None):
+        self.img_dir = img_dir
+        self.img_paths = [str(x) for x in Path(img_dir).rglob('*/images/*.*')]
+        self.img_paths.sort()
+
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.img_paths)
+
+    def __getitem__(self, idx):
+        img_path = self.img_paths[idx]
+        image = np.array(Image.open(img_path).convert("L"))
+        img = np.expand_dims(image, axis=-1)
+        mask_dir = img_path.replace('images', 'masks').rsplit('/', 1)[0]
+        mask_paths = [str(x) for x in Path(mask_dir).rglob('*.*')]
+
+        mask = np.zeros(img.shape[:2])
+        for mask_path in mask_paths:
+            cur_mask = np.array(Image.open(mask_path).convert("L"))
+            mask = np.maximum(mask, cur_mask)
+
+        image = image/np.max(image)
+        if len(np.unique(mask))==2:
+            mask = mask/np.max(mask)
+        mask = mask.astype(np.float32)
+
+        augmentations = self.transform(image=image, mask=mask)
+        image = augmentations['image']
+        mask = augmentations['mask']
+
+        image = np_to_tensor(image, is_mask=False)
+        mask = np_to_tensor(mask, is_mask=True)
 
         return {'images':image.contiguous(), 'masks':mask.contiguous()}
