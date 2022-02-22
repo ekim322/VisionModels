@@ -104,151 +104,11 @@ class Train():
             self.data_dict = self.data_dict or check_dataset(self.data)  # check if None
         train_path, val_path = self.data_dict['train'], self.data_dict['val']
         self.nc = 1 if self.single_cls else int(self.data_dict['nc'])  # number of classes
-        names = ['item'] if self.single_cls and len(self.data_dict['names']) != 1 else self.data_dict['names']  # class names
-        assert len(names) == self.nc, f'{len(names)} names found for nc={self.nc} dataset in {self.data}'  # check
+        self.names = ['item'] if self.single_cls and len(self.data_dict['names']) != 1 else self.data_dict['names']  # class names
+        assert len(self.names) == self.nc, f'{len(self.names)} names found for nc={self.nc} dataset in {self.data}'  # check
         self.is_coco = isinstance(val_path, str) and val_path.endswith('coco/val2017.txt')  # COCO dataset
         
-        # Freeze
-        freeze = [f'model.{x}.' for x in (freeze if len(freeze) > 1 else range(freeze[0]))]  # layers to freeze
-        for k, v in model.named_parameters():
-            v.requires_grad = True  # train all layers
-            if any(x in k for x in freeze):
-                LOGGER.info(f'freezing {k}')
-                v.requires_grad = False
-
-        # Image size
-        self.gs = max(int(model.stride.max()), 32)  # grid size (max stride)
-        self.imgsz = check_img_size(self.opt.imgsz, self.gs, floor=self.gs * 2)  # verify imgsz is gs-multiple
-
-        # Batch size
-        if RANK == -1 and batch_size == -1:  # single-GPU only, estimate best batch size
-            batch_size = check_train_batch_size(model, self.imgsz)
-            self.loggers.on_params_update({"batch_size": batch_size})
-
-        # Optimizer
-        self.nbs = 64  # nominal batch size
-        accumulate = max(round(self.nbs / batch_size), 1)  # accumulate loss before optimizing
-        self.hyp['weight_decay'] *= batch_size * accumulate / self.nbs  # scale weight_decay
-        LOGGER.info(f"Scaled weight_decay = {self.hyp['weight_decay']}")
-
-        g0, g1, g2 = [], [], []  # optimizer parameter groups
-        for v in model.modules():
-            if hasattr(v, 'bias') and isinstance(v.bias, nn.Parameter):  # bias
-                g2.append(v.bias)
-            if isinstance(v, nn.BatchNorm2d):  # weight (no decay)
-                g0.append(v.weight)
-            elif hasattr(v, 'weight') and isinstance(v.weight, nn.Parameter):  # weight (with decay)
-                g1.append(v.weight)
-
-        if self.opt.optimizer == 'Adam':
-            self.optimizer = Adam(g0, lr=self.hyp['lr0'], betas=(self.hyp['momentum'], 0.999))  # adjust beta1 to momentum
-        elif self.opt.optimizer == 'AdamW':
-            self.optimizer = AdamW(g0, lr=self.hyp['lr0'], betas=(self.hyp['momentum'], 0.999))  # adjust beta1 to momentum
-        else:
-            self.optimizer = SGD(g0, lr=self.hyp['lr0'], momentum=self.hyp['momentum'], nesterov=True)
-
-        self.optimizer.add_param_group({'params': g1, 'weight_decay': self.hyp['weight_decay']})  # add g1 with weight_decay
-        self.optimizer.add_param_group({'params': g2})  # add g2 (biases)
-        LOGGER.info(f"{colorstr('optimizer:')} {type(self.optimizer).__name__} with parameter groups "
-                    f"{len(g0)} weight (no decay), {len(g1)} weight, {len(g2)} bias")
-        del g0, g1, g2
-
-        # Scheduler
-        if self.opt.linear_lr:
-            self.lf = lambda x: (1 - x / (epochs - 1)) * (1.0 - self.hyp['lrf']) + self.hyp['lrf']  # linear
-        else:
-            self.lf = one_cycle(1, self.hyp['lrf'], epochs)  # cosine 1->hyp['lrf']
-        self.scheduler = lr_scheduler.LambdaLR(self.optimizer, lr_lambda=self.lf)  # plot_lr_scheduler(optimizer, scheduler, epochs)
-
-        # EMA
-        self.ema = ModelEMA(model) if RANK in [-1, 0] else None
-
-        # Resume
-        self.start_epoch, self.best_fitness = 0, 0.0
-        if weights.endswith('.pt'):
-            # Optimizer
-            if ckpt['optimizer'] is not None:
-                self.optimizer.load_state_dict(ckpt['optimizer'])
-                best_fitness = ckpt['best_fitness']
-
-            # EMA
-            if self.ema and ckpt.get('ema'):
-                self.ema.ema.load_state_dict(ckpt['ema'].float().state_dict())
-                self.ema.updates = ckpt['updates']
-
-            # Epochs
-            self.start_epoch = ckpt['epoch'] + 1
-            if self.resume:
-                assert self.start_epoch > 0, f'{weights} training to {epochs} epochs is finished, nothing to resume.'
-            if epochs < self.start_epoch:
-                LOGGER.info(f"{weights} has been trained for {ckpt['epoch']} epochs. Fine-tuning for {epochs} more epochs.")
-                epochs += ckpt['epoch']  # finetune additional epochs
-
-            del ckpt, csd
-
-        # DP mode
-        if self.cuda and RANK == -1 and torch.cuda.device_count() > 1:
-            LOGGER.warning('WARNING: DP not recommended, use torch.distributed.run for best DDP Multi-GPU results.\n'
-                        'See Multi-GPU Tutorial at https://github.com/ultralytics/yolov5/issues/475 to get started.')
-            model = torch.nn.DataParallel(model)
-
-        # SyncBatchNorm
-        if self.opt.sync_bn and self.cuda and RANK != -1:
-            model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model).to(self.device)
-            LOGGER.info('Using SyncBatchNorm()')
-
-        # Trainloader
-        self.train_loader, self.dataset = create_dataloader(train_path, self.imgsz, batch_size // WORLD_SIZE, self.gs, self.single_cls,
-                                                hyp=self.hyp, augment=True, cache=self.opt.cache, rect=self.opt.rect, rank=LOCAL_RANK,
-                                                workers=self.workers, image_weights=self.opt.image_weights, quad=self.opt.quad,
-                                                prefix=colorstr('train: '), shuffle=True)
-        mlc = int(np.concatenate(self.dataset.labels, 0)[:, 0].max())  # max label class
-        self.nb = len(self.train_loader)  # number of batches
-        assert mlc < self.nc, f'Label class {mlc} exceeds nc={self.nc} in {self.data}. Possible class labels are 0-{self.nc - 1}'
-
-        # Process 0
-        if RANK in [-1, 0]:
-            self.val_loader = create_dataloader(val_path, self.imgsz, batch_size // WORLD_SIZE * 2, self.gs, self.single_cls,
-                                        hyp=self.hyp, cache=None if self.noval else self.opt.cache, rect=True, rank=-1,
-                                        workers=self.workers, pad=0.5,
-                                        prefix=colorstr('val: '))[0]
-
-            if not self.resume:
-                labels = np.concatenate(self.dataset.labels, 0)
-                # c = torch.tensor(labels[:, 0])  # classes
-                # cf = torch.bincount(c.long(), minlength=nc) + 1.  # frequency
-                # model._initialize_biases(cf.to(device))
-                if self.plots:
-                    plot_labels(labels, names, self.save_dir)
-
-                # Anchors
-                if not self.opt.noautoanchor:
-                    check_anchors(self.dataset, model=model, thr=self.hyp['anchor_t'], imgsz=self.imgsz)
-                model.half().float()  # pre-reduce anchor precision
-
-            self.callbacks.run('on_pretrain_routine_end')
-
-        # DDP mode
-        if self.cuda and RANK != -1:
-            model = DDP(model, device_ids=[LOCAL_RANK], output_device=LOCAL_RANK)
-        
-        # Model attributes
-        nl = de_parallel(model).model[-1].nl  # number of detection layers (to scale hyps)
-        self.hyp['box'] *= 3 / nl  # scale to layers
-        self.hyp['cls'] *= self.nc / 80 * 3 / nl  # scale to classes and layers
-        self.hyp['obj'] *= (self.imgsz / 640) ** 2 * 3 / nl  # scale to image size and layers
-        self.hyp['label_smoothing'] = self.opt.label_smoothing
-        model.nc = self.nc  # attach number of classes to model
-        model.hyp = self.hyp  # attach hyperparameters to model
-        model.class_weights = labels_to_class_weights(self.dataset.labels, self.nc).to(self.device) * self.nc  # attach class weights
-        model.names = names
-        
-
     def train_step(self, model, epoch):
-        
-        # save_dir, epochs, batch_size, weights, single_cls, evolve, data, cfg, resume, noval, nosave, workers, freeze = \
-        #     Path(opt.save_dir), opt.epochs, opt.batch_size, opt.weights, opt.single_cls, opt.evolve, opt.data, opt.cfg, \
-        #     opt.resume, opt.noval, opt.nosave, opt.workers, opt.freeze
         
         # epoch ------------------------------------------------------------------
         model.train()
@@ -392,7 +252,6 @@ class Train():
         
         return True # continue loop
 
-
     def train_model(self, model):
                 
         # Start training
@@ -451,37 +310,156 @@ class Train():
 
     def create_model(self):
     
-        # save_dir, epochs, batch_size, weights, single_cls, evolve, data, cfg, resume, noval, nosave, workers, freeze = \
-        # Path(self.opt.save_dir), self.opt.epochs, self.opt.batch_size, self.opt.weights, self.opt.single_cls, self.opt.evolve, 
-        # self.opt.data, self.opt.cfg, self.opt.resume, self.opt.noval, self.opt.nosave, self.opt.workers, self.opt.freeze
-
-        # # Config
-        # plots = not evolve  # create plots
-        # cuda = device.type != 'cpu'
-        # init_seeds(1 + RANK)
-        # with torch_distributed_zero_first(LOCAL_RANK):
-            # data_dict = data_dict or check_dataset(self.data)  # check if None
-        # train_path, val_path = data_dict['train'], data_dict['val']
-        # nc = 1 if self.single_cls else int(data_dict['nc'])  # number of classes
-        # names = ['item'] if single_cls and len(data_dict['names']) != 1 else data_dict['names']  # class names
-        # assert len(names) == nc, f'{len(names)} names found for nc={nc} dataset in {data}'  # check
-        # is_coco = isinstance(val_path, str) and val_path.endswith('coco/val2017.txt')  # COCO dataset
-
         # Model
-        check_suffix(weights, '.pt')  # check weights
-        pretrained = weights.endswith('.pt')
+        check_suffix(self.weights, '.pt')  # check weights
+        pretrained = self.weights.endswith('.pt')
         if pretrained:
             with torch_distributed_zero_first(LOCAL_RANK):
-                weights = attempt_download(weights)  # download if not found locally
-            ckpt = torch.load(weights, map_location='cpu')  # load checkpoint to CPU to avoid CUDA memory leak
+                self.weights = attempt_download(self.weights)  # download if not found locally
+            ckpt = torch.load(self.weights, map_location='cpu')  # load checkpoint to CPU to avoid CUDA memory leak
             model = Model(self.cfg or ckpt['model'].yaml, ch=3, nc=self.nc, anchors=self.hyp.get('anchors')).to(self.device)  # create
             exclude = ['anchor'] if (self.cfg or self.hyp.get('anchors')) and not self.resume else []  # exclude keys
             csd = ckpt['model'].float().state_dict()  # checkpoint state_dict as FP32
             csd = intersect_dicts(csd, model.state_dict(), exclude=exclude)  # intersect
             model.load_state_dict(csd, strict=False)  # load
-            LOGGER.info(f'Transferred {len(csd)}/{len(model.state_dict())} items from {weights}')  # report
+            LOGGER.info(f'Transferred {len(csd)}/{len(model.state_dict())} items from {self.weights}')  # report
         else:
             model = Model(self.cfg, ch=3, nc=self.nc, anchors=self.hyp.get('anchors')).to(self.device)  # create
+            
+        # Freeze
+        freeze = [f'model.{x}.' for x in (freeze if len(freeze) > 1 else range(freeze[0]))]  # layers to freeze
+        for k, v in model.named_parameters():
+            v.requires_grad = True  # train all layers
+            if any(x in k for x in freeze):
+                LOGGER.info(f'freezing {k}')
+                v.requires_grad = False
+
+        # Image size
+        self.gs = max(int(model.stride.max()), 32)  # grid size (max stride)
+        self.imgsz = check_img_size(self.opt.imgsz, self.gs, floor=self.gs * 2)  # verify imgsz is gs-multiple
+
+        # Batch size
+        if RANK == -1 and batch_size == -1:  # single-GPU only, estimate best batch size
+            batch_size = check_train_batch_size(model, self.imgsz)
+            self.loggers.on_params_update({"batch_size": batch_size})
+
+        # Optimizer
+        self.nbs = 64  # nominal batch size
+        accumulate = max(round(self.nbs / batch_size), 1)  # accumulate loss before optimizing
+        self.hyp['weight_decay'] *= batch_size * accumulate / self.nbs  # scale weight_decay
+        LOGGER.info(f"Scaled weight_decay = {self.hyp['weight_decay']}")
+
+        g0, g1, g2 = [], [], []  # optimizer parameter groups
+        for v in model.modules():
+            if hasattr(v, 'bias') and isinstance(v.bias, nn.Parameter):  # bias
+                g2.append(v.bias)
+            if isinstance(v, nn.BatchNorm2d):  # weight (no decay)
+                g0.append(v.weight)
+            elif hasattr(v, 'weight') and isinstance(v.weight, nn.Parameter):  # weight (with decay)
+                g1.append(v.weight)
+
+        if self.opt.optimizer == 'Adam':
+            self.optimizer = Adam(g0, lr=self.hyp['lr0'], betas=(self.hyp['momentum'], 0.999))  # adjust beta1 to momentum
+        elif self.opt.optimizer == 'AdamW':
+            self.optimizer = AdamW(g0, lr=self.hyp['lr0'], betas=(self.hyp['momentum'], 0.999))  # adjust beta1 to momentum
+        else:
+            self.optimizer = SGD(g0, lr=self.hyp['lr0'], momentum=self.hyp['momentum'], nesterov=True)
+
+        self.optimizer.add_param_group({'params': g1, 'weight_decay': self.hyp['weight_decay']})  # add g1 with weight_decay
+        self.optimizer.add_param_group({'params': g2})  # add g2 (biases)
+        LOGGER.info(f"{colorstr('optimizer:')} {type(self.optimizer).__name__} with parameter groups "
+                    f"{len(g0)} weight (no decay), {len(g1)} weight, {len(g2)} bias")
+        del g0, g1, g2
+
+        # Scheduler
+        if self.opt.linear_lr:
+            self.lf = lambda x: (1 - x / (epochs - 1)) * (1.0 - self.hyp['lrf']) + self.hyp['lrf']  # linear
+        else:
+            self.lf = one_cycle(1, self.hyp['lrf'], epochs)  # cosine 1->hyp['lrf']
+        self.scheduler = lr_scheduler.LambdaLR(self.optimizer, lr_lambda=self.lf)  # plot_lr_scheduler(optimizer, scheduler, epochs)
+
+        # EMA
+        self.ema = ModelEMA(model) if RANK in [-1, 0] else None
+
+        # Resume
+        self.start_epoch, self.best_fitness = 0, 0.0
+        if self.weights.endswith('.pt'):
+            # Optimizer
+            if ckpt['optimizer'] is not None:
+                self.optimizer.load_state_dict(ckpt['optimizer'])
+                best_fitness = ckpt['best_fitness']
+
+            # EMA
+            if self.ema and ckpt.get('ema'):
+                self.ema.ema.load_state_dict(ckpt['ema'].float().state_dict())
+                self.ema.updates = ckpt['updates']
+
+            # Epochs
+            self.start_epoch = ckpt['epoch'] + 1
+            if self.resume:
+                assert self.start_epoch > 0, f'{self.weights} training to {epochs} epochs is finished, nothing to resume.'
+            if epochs < self.start_epoch:
+                LOGGER.info(f"{self.weights} has been trained for {ckpt['epoch']} epochs. Fine-tuning for {epochs} more epochs.")
+                epochs += ckpt['epoch']  # finetune additional epochs
+
+            del ckpt, csd
+
+        # DP mode
+        if self.cuda and RANK == -1 and torch.cuda.device_count() > 1:
+            LOGGER.warning('WARNING: DP not recommended, use torch.distributed.run for best DDP Multi-GPU results.\n'
+                        'See Multi-GPU Tutorial at https://github.com/ultralytics/yolov5/issues/475 to get started.')
+            model = torch.nn.DataParallel(model)
+
+        # SyncBatchNorm
+        if self.opt.sync_bn and self.cuda and RANK != -1:
+            model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model).to(self.device)
+            LOGGER.info('Using SyncBatchNorm()')
+
+        # Trainloader
+        self.train_loader, self.dataset = create_dataloader(self.train_path, self.imgsz, batch_size // WORLD_SIZE, self.gs, self.single_cls,
+                                                hyp=self.hyp, augment=True, cache=self.opt.cache, rect=self.opt.rect, rank=LOCAL_RANK,
+                                                workers=self.workers, image_weights=self.opt.image_weights, quad=self.opt.quad,
+                                                prefix=colorstr('train: '), shuffle=True)
+        mlc = int(np.concatenate(self.dataset.labels, 0)[:, 0].max())  # max label class
+        self.nb = len(self.train_loader)  # number of batches
+        assert mlc < self.nc, f'Label class {mlc} exceeds nc={self.nc} in {self.data}. Possible class labels are 0-{self.nc - 1}'
+
+        # Process 0
+        if RANK in [-1, 0]:
+            self.val_loader = create_dataloader(self.val_path, self.imgsz, batch_size // WORLD_SIZE * 2, self.gs, self.single_cls,
+                                        hyp=self.hyp, cache=None if self.noval else self.opt.cache, rect=True, rank=-1,
+                                        workers=self.workers, pad=0.5,
+                                        prefix=colorstr('val: '))[0]
+
+            if not self.resume:
+                labels = np.concatenate(self.dataset.labels, 0)
+                # c = torch.tensor(labels[:, 0])  # classes
+                # cf = torch.bincount(c.long(), minlength=nc) + 1.  # frequency
+                # model._initialize_biases(cf.to(device))
+                if self.plots:
+                    plot_labels(labels, self.names, self.save_dir)
+
+                # Anchors
+                if not self.opt.noautoanchor:
+                    check_anchors(self.dataset, model=model, thr=self.hyp['anchor_t'], imgsz=self.imgsz)
+                model.half().float()  # pre-reduce anchor precision
+
+            self.callbacks.run('on_pretrain_routine_end')
+
+        # DDP mode
+        if self.cuda and RANK != -1:
+            model = DDP(model, device_ids=[LOCAL_RANK], output_device=LOCAL_RANK)
+        
+        # Model attributes
+        nl = de_parallel(model).model[-1].nl  # number of detection layers (to scale hyps)
+        self.hyp['box'] *= 3 / nl  # scale to layers
+        self.hyp['cls'] *= self.nc / 80 * 3 / nl  # scale to classes and layers
+        self.hyp['obj'] *= (self.imgsz / 640) ** 2 * 3 / nl  # scale to image size and layers
+        self.hyp['label_smoothing'] = self.opt.label_smoothing
+        model.nc = self.nc  # attach number of classes to model
+        model.hyp = self.hyp  # attach hyperparameters to model
+        model.class_weights = labels_to_class_weights(self.dataset.labels, self.nc).to(self.device) * self.nc  # attach class weights
+        model.names = self.names
         
         return model
 
