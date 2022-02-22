@@ -61,165 +61,13 @@ class Train():
         self.callbacks = callbacks
         self.device = device
         
-
-    def train_step(self, model, epoch):
-        
-        save_dir, epochs, batch_size, weights, single_cls, evolve, data, cfg, resume, noval, nosave, workers, freeze = \
-            Path(opt.save_dir), opt.epochs, opt.batch_size, opt.weights, opt.single_cls, opt.evolve, opt.data, opt.cfg, \
-            opt.resume, opt.noval, opt.nosave, opt.workers, opt.freeze
-        
-        # epoch ------------------------------------------------------------------
-        model.train()
-
-        # Update image weights (optional, single-GPU only)
-        if opt.image_weights:
-            cw = model.class_weights.cpu().numpy() * (1 - maps) ** 2 / self.nc  # class weights
-            iw = labels_to_image_weights(self.dataset.labels, nc=self.nc, class_weights=cw)  # image weights
-            self.dataset.indices = random.choices(range(self.dataset.n), weights=iw, k=self.dataset.n)  # rand weighted idx
-
-        # Update mosaic border (optional)
-        # b = int(random.uniform(0.25 * imgsz, 0.75 * imgsz + gs) // gs * gs)
-        # dataset.mosaic_border = [b - imgsz, -b]  # height, width borders
-
-        self.mloss = torch.zeros(3, device=self.device)  # mean losses
-        if RANK != -1:
-            self.train_loader.sampler.set_epoch(epoch)
-        pbar = enumerate(self.train_loader)
-        LOGGER.info(('\n' + '%10s' * 7) % ('Epoch', 'gpu_mem', 'box', 'obj', 'cls', 'labels', 'img_size'))
-        if RANK in [-1, 0]:
-            pbar = tqdm(pbar, total=self.nb, bar_format='{l_bar}{bar:10}{r_bar}{bar:-10b}')  # progress bar
-        self.optimizer.zero_grad()
-        for i, (imgs, targets, paths, _) in pbar:  # batch -------------------------------------------------------------
-            ni = i + self.nb * epoch  # number integrated batches (since train start)
-            imgs = imgs.to(self.device, non_blocking=True).float() / 255  # uint8 to float32, 0-255 to 0.0-1.0
-
-            # Warmup
-            if ni <= self.nw:
-                xi = [0, self.nw]  # x interp
-                # compute_loss.gr = np.interp(ni, xi, [0.0, 1.0])  # iou loss ratio (obj_loss = 1.0 or iou)
-                accumulate = max(1, np.interp(ni, xi, [1, self.nbs / batch_size]).round())
-                for j, x in enumerate(self.optimizer.param_groups):
-                    # bias lr falls from 0.1 to lr0, all other lrs rise from 0.0 to lr0
-                    x['lr'] = np.interp(ni, xi, [self.hyp['warmup_bias_lr'] if j == 2 else 0.0, x['initial_lr'] * self.lf(epoch)])
-                    if 'momentum' in x:
-                        x['momentum'] = np.interp(ni, xi, [self.hyp['warmup_momentum'], self.hyp['momentum']])
-
-            # Multi-scale
-            if opt.multi_scale:
-                sz = random.randrange(self.imgsz * 0.5, self.imgsz * 1.5 + self.gs) // self.gs * self.gs  # size
-                sf = sz / max(imgs.shape[2:])  # scale factor
-                if sf != 1:
-                    ns = [math.ceil(x * sf / self.gs) * self.gs for x in imgs.shape[2:]]  # new shape (stretched to gs-multiple)
-                    imgs = nn.functional.interpolate(imgs, size=ns, mode='bilinear', align_corners=False)
-
-            # Forward
-            with amp.autocast(enabled=self.cuda):
-                pred = model(imgs)  # forward
-                loss, loss_items = self.compute_loss(pred, targets.to(self.device))  # loss scaled by batch_size
-                if RANK != -1:
-                    loss *= WORLD_SIZE  # gradient averaged between devices in DDP mode
-                if opt.quad:
-                    loss *= 4.
-
-            # Backward
-            self.scaler.scale(loss).backward()
-
-            # Optimize
-            if ni - last_opt_step >= accumulate:
-                self.scaler.step(self.optimizer)  # optimizer.step
-                self.scaler.update()
-                self.optimizer.zero_grad()
-                if self.ema:
-                    self.ema.update(model)
-                last_opt_step = ni
-
-            # Log
-            if RANK in [-1, 0]:
-                self.mloss = (self.mloss * i + loss_items) / (i + 1)  # update mean losses
-                mem = f'{torch.cuda.memory_reserved() / 1E9 if torch.cuda.is_available() else 0:.3g}G'  # (GB)
-                pbar.set_description(('%10s' * 2 + '%10.4g' * 5) % (
-                    f'{epoch}/{epochs - 1}', mem, *self.mloss, targets.shape[0], imgs.shape[-1]))
-                self.callbacks.run('on_train_batch_end', ni, model, imgs, targets, paths, self.plots, opt.sync_bn)
-                if self.callbacks.stop_training:
-                    return
-            # end batch ------------------------------------------------------------------------------------------------
-
-        # Scheduler
-        self.lr = [x['lr'] for x in self.optimizer.param_groups]  # for loggers
-        self.scheduler.step()
-
-        if RANK in [-1, 0]:
-            # mAP
-            self.callbacks.run('on_train_epoch_end', epoch=epoch)
-            self.ema.update_attr(model, include=['yaml', 'nc', 'hyp', 'names', 'stride', 'class_weights'])
-            final_epoch = (epoch + 1 == epochs) or self.stopper.possible_stop
-            if not noval or final_epoch:  # Calculate mAP
-                results, maps, _ = val.run(self.data_dict,
-                                            batch_size=batch_size // WORLD_SIZE * 2,
-                                            imgsz=self.imgsz,
-                                            model=self.ema.ema,
-                                            single_cls=single_cls,
-                                            dataloader=self.val_loader,
-                                            save_dir=save_dir,
-                                            plots=False,
-                                            callbacks=self.callbacks,
-                                            compute_loss=self.compute_loss)
-
-            # Update best mAP
-            self.fi = fitness(np.array(results).reshape(1, -1))  # weighted combination of [P, R, mAP@.5, mAP@.5-.95]
-            if self.fi > best_fitness:
-                best_fitness = self.fi
-            log_vals = list(self.mloss) + list(results) + self.lr
-            self.callbacks.run('on_fit_epoch_end', log_vals, epoch, best_fitness, self.fi)
-
-            # Save model
-            if (not nosave) or (final_epoch and not evolve):  # if save
-                ckpt = {'epoch': epoch,
-                        'best_fitness': best_fitness,
-                        'model': deepcopy(de_parallel(model)).half(),
-                        'ema': deepcopy(self.ema.ema).half(),
-                        'updates': self.ema.updates,
-                        'optimizer': self.optimizer.state_dict(),
-                        'wandb_id': self.loggers.wandb.wandb_run.id if self.loggers.wandb else None,
-                        'date': datetime.now().isoformat()}
-
-                # Save last, best and delete
-                torch.save(ckpt, self.last)
-                if best_fitness == self.fi:
-                    torch.save(ckpt, self.best)
-                if (epoch > 0) and (opt.save_period > 0) and (epoch % opt.save_period == 0):
-                    torch.save(ckpt, self.w / f'epoch{epoch}.pt')
-                del ckpt
-                self.callbacks.run('on_model_save', self.last, epoch, final_epoch, best_fitness, self.fi)
-
-            # Stop Single-GPU
-            if RANK == -1 and self.stopper(epoch=epoch, fitness=self.fi):
-                return False # break loop
-
-            # Stop DDP TODO: known issues shttps://github.com/ultralytics/yolov5/pull/4576
-            # stop = stopper(epoch=epoch, fitness=fi)
-            # if RANK == 0:
-            #    dist.broadcast_object_list([stop], 0)  # broadcast 'stop' to all ranks
-
-        # Stop DPP
-        # with torch_distributed_zero_first(RANK):
-        # if stop:
-        #    break  # must break all DDP ranks
-
-        # end epoch
-        
-        return True # continue loop
-
-
-    def train_model(self, model):
-        
-        save_dir, epochs, batch_size, weights, single_cls, evolve, data, cfg, resume, noval, nosave, workers, freeze = \
+        self.save_dir, self.epochs, self.batch_size, self.weights, self.single_cls, self.evolve, self.data, self.cfg, self.resume, self.noval, self.nosave, self.workers, self.freeze = \
         Path(self.opt.save_dir), self.opt.epochs, self.opt.batch_size, self.opt.weights, self.opt.single_cls, self.opt.evolve, 
         self.opt.data, self.opt.cfg, self.opt.resume, self.opt.noval, self.opt.nosave, self.opt.workers, self.opt.freeze
         
         # Directories
-        self.w = save_dir / 'weights'  # weights dir
-        (self.w.parent if evolve else self.w).mkdir(parents=True, exist_ok=True)  # make dir
+        self.w = self.save_dir / 'weights'  # weights dir
+        (self.w.parent if self.evolve else self.w).mkdir(parents=True, exist_ok=True)  # make dir
         self.last, self.best = self.w / 'last.pt', self.w / 'best.pt'
         
         # Hyperparameters
@@ -229,19 +77,19 @@ class Train():
         LOGGER.info(colorstr('hyperparameters: ') + ', '.join(f'{k}={v}' for k, v in self.hyp.items()))
         
         # Save run settings
-        if not evolve:
-            with open(save_dir / 'hyp.yaml', 'w') as f:
+        if not self.evolve:
+            with open(self.save_dir / 'hyp.yaml', 'w') as f:
                 yaml.safe_dump(self.hyp, f, sort_keys=False)
-            with open(save_dir / 'opt.yaml', 'w') as f:
+            with open(self.save_dir / 'opt.yaml', 'w') as f:
                 yaml.safe_dump(vars(self.opt), f, sort_keys=False)
         
         # Loggers
         self.data_dict = None
         if RANK in [-1, 0]:
-            self.loggers = Loggers(save_dir, weights, self.opt, self.hyp, LOGGER)  # loggers instance
+            self.loggers = Loggers(self.save_dir, weights, self.opt, self.hyp, LOGGER)  # loggers instance
             if self.loggers.wandb:
                 self.data_dict = self.loggers.wandb.data_dict
-                if resume:
+                if self.resume:
                     weights, epochs, self.hyp, batch_size = self.opt.weights, self.opt.epochs, self.opt.hyp, self.opt.batch_size
 
             # Register actions
@@ -249,16 +97,16 @@ class Train():
                 self.callbacks.register_action(k, callback=getattr(self.loggers, k))
                 
         # Config
-        self.plots = not evolve  # create plots
+        self.plots = not self.evolve  # create plots
         self.cuda = self.device.type != 'cpu'
         init_seeds(1 + RANK)
         with torch_distributed_zero_first(LOCAL_RANK):
-            self.data_dict = self.data_dict or check_dataset(data)  # check if None
+            self.data_dict = self.data_dict or check_dataset(self.data)  # check if None
         train_path, val_path = self.data_dict['train'], self.data_dict['val']
-        self.nc = 1 if single_cls else int(self.data_dict['nc'])  # number of classes
-        names = ['item'] if single_cls and len(self.data_dict['names']) != 1 else self.data_dict['names']  # class names
-        assert len(names) == self.nc, f'{len(names)} names found for nc={self.nc} dataset in {data}'  # check
-        is_coco = isinstance(val_path, str) and val_path.endswith('coco/val2017.txt')  # COCO dataset
+        self.nc = 1 if self.single_cls else int(self.data_dict['nc'])  # number of classes
+        names = ['item'] if self.single_cls and len(self.data_dict['names']) != 1 else self.data_dict['names']  # class names
+        assert len(names) == self.nc, f'{len(names)} names found for nc={self.nc} dataset in {self.data}'  # check
+        self.is_coco = isinstance(val_path, str) and val_path.endswith('coco/val2017.txt')  # COCO dataset
         
         # Freeze
         freeze = [f'model.{x}.' for x in (freeze if len(freeze) > 1 else range(freeze[0]))]  # layers to freeze
@@ -316,7 +164,7 @@ class Train():
         self.ema = ModelEMA(model) if RANK in [-1, 0] else None
 
         # Resume
-        start_epoch, best_fitness = 0, 0.0
+        self.start_epoch, self.best_fitness = 0, 0.0
         if weights.endswith('.pt'):
             # Optimizer
             if ckpt['optimizer'] is not None:
@@ -329,10 +177,10 @@ class Train():
                 self.ema.updates = ckpt['updates']
 
             # Epochs
-            start_epoch = ckpt['epoch'] + 1
-            if resume:
-                assert start_epoch > 0, f'{weights} training to {epochs} epochs is finished, nothing to resume.'
-            if epochs < start_epoch:
+            self.start_epoch = ckpt['epoch'] + 1
+            if self.resume:
+                assert self.start_epoch > 0, f'{weights} training to {epochs} epochs is finished, nothing to resume.'
+            if epochs < self.start_epoch:
                 LOGGER.info(f"{weights} has been trained for {ckpt['epoch']} epochs. Fine-tuning for {epochs} more epochs.")
                 epochs += ckpt['epoch']  # finetune additional epochs
 
@@ -350,28 +198,28 @@ class Train():
             LOGGER.info('Using SyncBatchNorm()')
 
         # Trainloader
-        self.train_loader, self.dataset = create_dataloader(train_path, self.imgsz, batch_size // WORLD_SIZE, self.gs, single_cls,
+        self.train_loader, self.dataset = create_dataloader(train_path, self.imgsz, batch_size // WORLD_SIZE, self.gs, self.single_cls,
                                                 hyp=self.hyp, augment=True, cache=self.opt.cache, rect=self.opt.rect, rank=LOCAL_RANK,
-                                                workers=workers, image_weights=self.opt.image_weights, quad=self.opt.quad,
+                                                workers=self.workers, image_weights=self.opt.image_weights, quad=self.opt.quad,
                                                 prefix=colorstr('train: '), shuffle=True)
         mlc = int(np.concatenate(self.dataset.labels, 0)[:, 0].max())  # max label class
         self.nb = len(self.train_loader)  # number of batches
-        assert mlc < self.nc, f'Label class {mlc} exceeds nc={self.nc} in {data}. Possible class labels are 0-{self.nc - 1}'
+        assert mlc < self.nc, f'Label class {mlc} exceeds nc={self.nc} in {self.data}. Possible class labels are 0-{self.nc - 1}'
 
         # Process 0
         if RANK in [-1, 0]:
-            self.val_loader = create_dataloader(val_path, self.imgsz, batch_size // WORLD_SIZE * 2, self.gs, single_cls,
-                                        hyp=self.hyp, cache=None if noval else self.opt.cache, rect=True, rank=-1,
-                                        workers=workers, pad=0.5,
+            self.val_loader = create_dataloader(val_path, self.imgsz, batch_size // WORLD_SIZE * 2, self.gs, self.single_cls,
+                                        hyp=self.hyp, cache=None if self.noval else self.opt.cache, rect=True, rank=-1,
+                                        workers=self.workers, pad=0.5,
                                         prefix=colorstr('val: '))[0]
 
-            if not resume:
+            if not self.resume:
                 labels = np.concatenate(self.dataset.labels, 0)
                 # c = torch.tensor(labels[:, 0])  # classes
                 # cf = torch.bincount(c.long(), minlength=nc) + 1.  # frequency
                 # model._initialize_biases(cf.to(device))
                 if self.plots:
-                    plot_labels(labels, names, save_dir)
+                    plot_labels(labels, names, self.save_dir)
 
                 # Anchors
                 if not self.opt.noautoanchor:
@@ -395,6 +243,158 @@ class Train():
         model.class_weights = labels_to_class_weights(self.dataset.labels, self.nc).to(self.device) * self.nc  # attach class weights
         model.names = names
         
+
+    def train_step(self, model, epoch):
+        
+        # save_dir, epochs, batch_size, weights, single_cls, evolve, data, cfg, resume, noval, nosave, workers, freeze = \
+        #     Path(opt.save_dir), opt.epochs, opt.batch_size, opt.weights, opt.single_cls, opt.evolve, opt.data, opt.cfg, \
+        #     opt.resume, opt.noval, opt.nosave, opt.workers, opt.freeze
+        
+        # epoch ------------------------------------------------------------------
+        model.train()
+
+        # Update image weights (optional, single-GPU only)
+        if opt.image_weights:
+            cw = model.class_weights.cpu().numpy() * (1 - maps) ** 2 / self.nc  # class weights
+            iw = labels_to_image_weights(self.dataset.labels, nc=self.nc, class_weights=cw)  # image weights
+            self.dataset.indices = random.choices(range(self.dataset.n), weights=iw, k=self.dataset.n)  # rand weighted idx
+
+        # Update mosaic border (optional)
+        # b = int(random.uniform(0.25 * imgsz, 0.75 * imgsz + gs) // gs * gs)
+        # dataset.mosaic_border = [b - imgsz, -b]  # height, width borders
+
+        self.mloss = torch.zeros(3, device=self.device)  # mean losses
+        if RANK != -1:
+            self.train_loader.sampler.set_epoch(epoch)
+        pbar = enumerate(self.train_loader)
+        LOGGER.info(('\n' + '%10s' * 7) % ('Epoch', 'gpu_mem', 'box', 'obj', 'cls', 'labels', 'img_size'))
+        if RANK in [-1, 0]:
+            pbar = tqdm(pbar, total=self.nb, bar_format='{l_bar}{bar:10}{r_bar}{bar:-10b}')  # progress bar
+        self.optimizer.zero_grad()
+        for i, (imgs, targets, paths, _) in pbar:  # batch -------------------------------------------------------------
+            ni = i + self.nb * epoch  # number integrated batches (since train start)
+            imgs = imgs.to(self.device, non_blocking=True).float() / 255  # uint8 to float32, 0-255 to 0.0-1.0
+
+            # Warmup
+            if ni <= self.nw:
+                xi = [0, self.nw]  # x interp
+                # compute_loss.gr = np.interp(ni, xi, [0.0, 1.0])  # iou loss ratio (obj_loss = 1.0 or iou)
+                accumulate = max(1, np.interp(ni, xi, [1, self.nbs / self.batch_size]).round())
+                for j, x in enumerate(self.optimizer.param_groups):
+                    # bias lr falls from 0.1 to lr0, all other lrs rise from 0.0 to lr0
+                    x['lr'] = np.interp(ni, xi, [self.hyp['warmup_bias_lr'] if j == 2 else 0.0, x['initial_lr'] * self.lf(epoch)])
+                    if 'momentum' in x:
+                        x['momentum'] = np.interp(ni, xi, [self.hyp['warmup_momentum'], self.hyp['momentum']])
+
+            # Multi-scale
+            if opt.multi_scale:
+                sz = random.randrange(self.imgsz * 0.5, self.imgsz * 1.5 + self.gs) // self.gs * self.gs  # size
+                sf = sz / max(imgs.shape[2:])  # scale factor
+                if sf != 1:
+                    ns = [math.ceil(x * sf / self.gs) * self.gs for x in imgs.shape[2:]]  # new shape (stretched to gs-multiple)
+                    imgs = nn.functional.interpolate(imgs, size=ns, mode='bilinear', align_corners=False)
+
+            # Forward
+            with amp.autocast(enabled=self.cuda):
+                pred = model(imgs)  # forward
+                loss, loss_items = self.compute_loss(pred, targets.to(self.device))  # loss scaled by batch_size
+                if RANK != -1:
+                    loss *= WORLD_SIZE  # gradient averaged between devices in DDP mode
+                if opt.quad:
+                    loss *= 4.
+
+            # Backward
+            self.scaler.scale(loss).backward()
+
+            # Optimize
+            if ni - last_opt_step >= accumulate:
+                self.scaler.step(self.optimizer)  # optimizer.step
+                self.scaler.update()
+                self.optimizer.zero_grad()
+                if self.ema:
+                    self.ema.update(model)
+                last_opt_step = ni
+
+            # Log
+            if RANK in [-1, 0]:
+                self.mloss = (self.mloss * i + loss_items) / (i + 1)  # update mean losses
+                mem = f'{torch.cuda.memory_reserved() / 1E9 if torch.cuda.is_available() else 0:.3g}G'  # (GB)
+                pbar.set_description(('%10s' * 2 + '%10.4g' * 5) % (
+                    f'{epoch}/{self.epochs - 1}', mem, *self.mloss, targets.shape[0], imgs.shape[-1]))
+                self.callbacks.run('on_train_batch_end', ni, model, imgs, targets, paths, self.plots, opt.sync_bn)
+                if self.callbacks.stop_training:
+                    return
+            # end batch ------------------------------------------------------------------------------------------------
+
+        # Scheduler
+        self.lr = [x['lr'] for x in self.optimizer.param_groups]  # for loggers
+        self.scheduler.step()
+
+        if RANK in [-1, 0]:
+            # mAP
+            self.callbacks.run('on_train_epoch_end', epoch=epoch)
+            self.ema.update_attr(model, include=['yaml', 'nc', 'hyp', 'names', 'stride', 'class_weights'])
+            final_epoch = (epoch + 1 == self.epochs) or self.stopper.possible_stop
+            if not self.noval or final_epoch:  # Calculate mAP
+                results, maps, _ = val.run(self.data_dict,
+                                            batch_size=self.batch_size // WORLD_SIZE * 2,
+                                            imgsz=self.imgsz,
+                                            model=self.ema.ema,
+                                            single_cls=self.single_cls,
+                                            dataloader=self.val_loader,
+                                            save_dir=self.save_dir,
+                                            plots=False,
+                                            callbacks=self.callbacks,
+                                            compute_loss=self.compute_loss)
+
+            # Update best mAP
+            self.fi = fitness(np.array(results).reshape(1, -1))  # weighted combination of [P, R, mAP@.5, mAP@.5-.95]
+            if self.fi > best_fitness:
+                best_fitness = self.fi
+            log_vals = list(self.mloss) + list(results) + self.lr
+            self.callbacks.run('on_fit_epoch_end', log_vals, epoch, best_fitness, self.fi)
+
+            # Save model
+            if (not self.nosave) or (final_epoch and not self.evolve):  # if save
+                ckpt = {'epoch': epoch,
+                        'best_fitness': best_fitness,
+                        'model': deepcopy(de_parallel(model)).half(),
+                        'ema': deepcopy(self.ema.ema).half(),
+                        'updates': self.ema.updates,
+                        'optimizer': self.optimizer.state_dict(),
+                        'wandb_id': self.loggers.wandb.wandb_run.id if self.loggers.wandb else None,
+                        'date': datetime.now().isoformat()}
+
+                # Save last, best and delete
+                torch.save(ckpt, self.last)
+                if best_fitness == self.fi:
+                    torch.save(ckpt, self.best)
+                if (epoch > 0) and (opt.save_period > 0) and (epoch % opt.save_period == 0):
+                    torch.save(ckpt, self.w / f'epoch{epoch}.pt')
+                del ckpt
+                self.callbacks.run('on_model_save', self.last, epoch, final_epoch, best_fitness, self.fi)
+
+            # Stop Single-GPU
+            if RANK == -1 and self.stopper(epoch=epoch, fitness=self.fi):
+                return False # break loop
+
+            # Stop DDP TODO: known issues shttps://github.com/ultralytics/yolov5/pull/4576
+            # stop = stopper(epoch=epoch, fitness=fi)
+            # if RANK == 0:
+            #    dist.broadcast_object_list([stop], 0)  # broadcast 'stop' to all ranks
+
+        # Stop DPP
+        # with torch_distributed_zero_first(RANK):
+        # if stop:
+        #    break  # must break all DDP ranks
+
+        # end epoch
+        
+        return True # continue loop
+
+
+    def train_model(self, model):
+                
         # Start training
         t0 = time.time()
         self.nw = max(round(self.hyp['warmup_epochs'] * self.nb), 1000)  # number of warmup iterations, max(3 epochs, 1k iterations)
@@ -402,67 +402,67 @@ class Train():
         last_opt_step = -1
         maps = np.zeros(self.nc)  # mAP per class
         results = (0, 0, 0, 0, 0, 0, 0)  # P, R, mAP@.5, mAP@.5-.95, val_loss(box, obj, cls)
-        self.scheduler.last_epoch = start_epoch - 1  # do not move
+        self.scheduler.last_epoch = self.start_epoch - 1  # do not move
         self.scaler = amp.GradScaler(enabled=self.cuda)
         self.stopper = EarlyStopping(patience=self.opt.patience)
         self.compute_loss = ComputeLoss(model)  # init loss class
         LOGGER.info(f'Image sizes {self.imgsz} train, {self.imgsz} val\n'
                     f'Using {self.train_loader.num_workers * WORLD_SIZE} dataloader workers\n'
-                    f"Logging results to {colorstr('bold', save_dir)}\n"
-                    f'Starting training for {epochs} epochs...')
+                    f"Logging results to {colorstr('bold', self.save_dir)}\n"
+                    f'Starting training for {self.epochs} epochs...')
         
         writer = SummaryWriter(os.path.join('logs', self.opt.name)) # should use cfg
         
-        for epoch in range(start_epoch, epochs):
-            loop = Train.train_step(model, epoch)
+        for epoch in range(self.start_epoch, self.epochs):
+            loop = self.train_step(model, epoch)
             
             if not loop:
                 break
         # end training -----------------------------------------------------------------------------------------------------
         
         if RANK in [-1, 0]:
-            LOGGER.info(f'\n{epoch - start_epoch + 1} epochs completed in {(time.time() - t0) / 3600:.3f} hours.')
+            LOGGER.info(f'\n{epoch - self.start_epoch + 1} epochs completed in {(time.time() - t0) / 3600:.3f} hours.')
             for f in self.last, self.best:
                 if f.exists():
                     strip_optimizer(f)  # strip optimizers
                     if f is self.best:
                         LOGGER.info(f'\nValidating {f}...')
                         results, _, _ = val.run(self.data_dict,
-                                                batch_size=batch_size // WORLD_SIZE * 2,
+                                                batch_size=self.batch_size // WORLD_SIZE * 2,
                                                 imgsz=self.imgsz,
                                                 model=attempt_load(f, self.device).half(),
-                                                iou_thres=0.65 if is_coco else 0.60,  # best pycocotools results at 0.65
-                                                single_cls=single_cls,
+                                                iou_thres=0.65 if self.is_coco else 0.60,  # best pycocotools results at 0.65
+                                                single_cls=self.single_cls,
                                                 dataloader=self.val_loader,
-                                                save_dir=save_dir,
-                                                save_json=is_coco,
+                                                save_dir=self.save_dir,
+                                                save_json=self.is_coco,
                                                 verbose=True,
                                                 plots=True,
                                                 callbacks=self.callbacks,
                                                 compute_loss=self.compute_loss)  # val best model with plots
-                        if is_coco:
-                            self.callbacks.run('on_fit_epoch_end', list(self.mloss) + list(results) + self.lr, epoch, best_fitness, self.fi)
+                        if self.is_coco:
+                            self.callbacks.run('on_fit_epoch_end', list(self.mloss) + list(results) + self.lr, epoch, self.best_fitness, self.fi)
 
             self.callbacks.run('on_train_end', self.last, self.best, self.plots, epoch, results)
-            LOGGER.info(f"Results saved to {colorstr('bold', save_dir)}")
+            LOGGER.info(f"Results saved to {colorstr('bold', self.save_dir)}")
 
         torch.cuda.empty_cache()
         return results
 
     def create_model(self):
     
-        save_dir, epochs, batch_size, weights, single_cls, evolve, data, cfg, resume, noval, nosave, workers, freeze = \
-        Path(self.opt.save_dir), self.opt.epochs, self.opt.batch_size, self.opt.weights, self.opt.single_cls, self.opt.evolve, 
-        self.opt.data, self.opt.cfg, self.opt.resume, self.opt.noval, self.opt.nosave, self.opt.workers, self.opt.freeze
+        # save_dir, epochs, batch_size, weights, single_cls, evolve, data, cfg, resume, noval, nosave, workers, freeze = \
+        # Path(self.opt.save_dir), self.opt.epochs, self.opt.batch_size, self.opt.weights, self.opt.single_cls, self.opt.evolve, 
+        # self.opt.data, self.opt.cfg, self.opt.resume, self.opt.noval, self.opt.nosave, self.opt.workers, self.opt.freeze
 
         # # Config
         # plots = not evolve  # create plots
         # cuda = device.type != 'cpu'
         # init_seeds(1 + RANK)
-        with torch_distributed_zero_first(LOCAL_RANK):
-            data_dict = data_dict or check_dataset(data)  # check if None
+        # with torch_distributed_zero_first(LOCAL_RANK):
+            # data_dict = data_dict or check_dataset(self.data)  # check if None
         # train_path, val_path = data_dict['train'], data_dict['val']
-        nc = 1 if single_cls else int(data_dict['nc'])  # number of classes
+        # nc = 1 if self.single_cls else int(data_dict['nc'])  # number of classes
         # names = ['item'] if single_cls and len(data_dict['names']) != 1 else data_dict['names']  # class names
         # assert len(names) == nc, f'{len(names)} names found for nc={nc} dataset in {data}'  # check
         # is_coco = isinstance(val_path, str) and val_path.endswith('coco/val2017.txt')  # COCO dataset
@@ -474,14 +474,14 @@ class Train():
             with torch_distributed_zero_first(LOCAL_RANK):
                 weights = attempt_download(weights)  # download if not found locally
             ckpt = torch.load(weights, map_location='cpu')  # load checkpoint to CPU to avoid CUDA memory leak
-            model = Model(cfg or ckpt['model'].yaml, ch=3, nc=nc, anchors=self.hyp.get('anchors')).to(self.device)  # create
-            exclude = ['anchor'] if (cfg or self.hyp.get('anchors')) and not resume else []  # exclude keys
+            model = Model(self.cfg or ckpt['model'].yaml, ch=3, nc=self.nc, anchors=self.hyp.get('anchors')).to(self.device)  # create
+            exclude = ['anchor'] if (self.cfg or self.hyp.get('anchors')) and not self.resume else []  # exclude keys
             csd = ckpt['model'].float().state_dict()  # checkpoint state_dict as FP32
             csd = intersect_dicts(csd, model.state_dict(), exclude=exclude)  # intersect
             model.load_state_dict(csd, strict=False)  # load
             LOGGER.info(f'Transferred {len(csd)}/{len(model.state_dict())} items from {weights}')  # report
         else:
-            model = Model(cfg, ch=3, nc=nc, anchors=self.hyp.get('anchors')).to(self.device)  # create
+            model = Model(self.cfg, ch=3, nc=self.nc, anchors=self.hyp.get('anchors')).to(self.device)  # create
         
         return model
 
