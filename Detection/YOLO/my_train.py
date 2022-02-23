@@ -62,8 +62,8 @@ class Train():
         self.device = device
         
         self.save_dir, self.epochs, self.batch_size, self.weights, self.single_cls, self.evolve, self.data, self.cfg, self.resume, self.noval, self.nosave, self.workers, self.freeze = \
-        Path(self.opt.save_dir), self.opt.epochs, self.opt.batch_size, self.opt.weights, self.opt.single_cls, self.opt.evolve, 
-        self.opt.data, self.opt.cfg, self.opt.resume, self.opt.noval, self.opt.nosave, self.opt.workers, self.opt.freeze
+            Path(self.opt.save_dir), self.opt.epochs, self.opt.batch_size, self.opt.weights, self.opt.single_cls, self.opt.evolve, \
+            self.opt.data, self.opt.cfg, self.opt.resume, self.opt.noval, self.opt.nosave, self.opt.workers, self.opt.freeze
         
         # Directories
         self.w = self.save_dir / 'weights'  # weights dir
