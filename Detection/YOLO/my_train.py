@@ -167,13 +167,13 @@ class Train():
             self.scaler.scale(loss).backward()
 
             # Optimize
-            if ni - last_opt_step >= self.accumulate:
+            if ni - self.last_opt_step >= self.accumulate:
                 self.scaler.step(self.optimizer)  # optimizer.step
                 self.scaler.update()
                 self.optimizer.zero_grad()
                 if self.ema:
                     self.ema.update(model)
-                last_opt_step = ni
+                self.last_opt_step = ni
 
             # Log
             if RANK in [-1, 0]:
@@ -258,7 +258,7 @@ class Train():
         t0 = time.time()
         self.nw = max(round(self.hyp['warmup_epochs'] * self.nb), 1000)  # number of warmup iterations, max(3 epochs, 1k iterations)
         # nw = min(nw, (epochs - start_epoch) / 2 * nb)  # limit warmup to < 1/2 of training
-        last_opt_step = -1
+        self.last_opt_step = -1
         maps = np.zeros(self.nc)  # mAP per class
         results = (0, 0, 0, 0, 0, 0, 0)  # P, R, mAP@.5, mAP@.5-.95, val_loss(box, obj, cls)
         self.scheduler.last_epoch = self.start_epoch - 1  # do not move
