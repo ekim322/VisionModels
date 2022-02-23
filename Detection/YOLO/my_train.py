@@ -86,11 +86,11 @@ class Train():
         # Loggers
         self.data_dict = None
         if RANK in [-1, 0]:
-            self.loggers = Loggers(self.save_dir, weights, self.opt, self.hyp, LOGGER)  # loggers instance
+            self.loggers = Loggers(self.save_dir, self.weights, self.opt, self.hyp, LOGGER)  # loggers instance
             if self.loggers.wandb:
                 self.data_dict = self.loggers.wandb.data_dict
                 if self.resume:
-                    weights, epochs, self.hyp, batch_size = self.opt.weights, self.opt.epochs, self.opt.hyp, self.opt.batch_size
+                    self.weights, self.epochs, self.hyp, self.batch_size = self.opt.weights, self.opt.epochs, self.opt.hyp, self.opt.batch_size
 
             # Register actions
             for k in methods(self.loggers):
@@ -102,11 +102,11 @@ class Train():
         init_seeds(1 + RANK)
         with torch_distributed_zero_first(LOCAL_RANK):
             self.data_dict = self.data_dict or check_dataset(self.data)  # check if None
-        train_path, val_path = self.data_dict['train'], self.data_dict['val']
+        self.train_path, self.val_path = self.data_dict['train'], self.data_dict['val']
         self.nc = 1 if self.single_cls else int(self.data_dict['nc'])  # number of classes
         self.names = ['item'] if self.single_cls and len(self.data_dict['names']) != 1 else self.data_dict['names']  # class names
         assert len(self.names) == self.nc, f'{len(self.names)} names found for nc={self.nc} dataset in {self.data}'  # check
-        self.is_coco = isinstance(val_path, str) and val_path.endswith('coco/val2017.txt')  # COCO dataset
+        self.is_coco = isinstance(self.val_path, str) and self.val_path.endswith('coco/val2017.txt')  # COCO dataset
         
     def train_step(self, model, epoch):
         
@@ -139,7 +139,7 @@ class Train():
             if ni <= self.nw:
                 xi = [0, self.nw]  # x interp
                 # compute_loss.gr = np.interp(ni, xi, [0.0, 1.0])  # iou loss ratio (obj_loss = 1.0 or iou)
-                accumulate = max(1, np.interp(ni, xi, [1, self.nbs / self.batch_size]).round())
+                self.accumulate = max(1, np.interp(ni, xi, [1, self.nbs / self.batch_size]).round())
                 for j, x in enumerate(self.optimizer.param_groups):
                     # bias lr falls from 0.1 to lr0, all other lrs rise from 0.0 to lr0
                     x['lr'] = np.interp(ni, xi, [self.hyp['warmup_bias_lr'] if j == 2 else 0.0, x['initial_lr'] * self.lf(epoch)])
@@ -167,7 +167,7 @@ class Train():
             self.scaler.scale(loss).backward()
 
             # Optimize
-            if ni - last_opt_step >= accumulate:
+            if ni - last_opt_step >= self.accumulate:
                 self.scaler.step(self.optimizer)  # optimizer.step
                 self.scaler.update()
                 self.optimizer.zero_grad()
@@ -209,15 +209,15 @@ class Train():
 
             # Update best mAP
             self.fi = fitness(np.array(results).reshape(1, -1))  # weighted combination of [P, R, mAP@.5, mAP@.5-.95]
-            if self.fi > best_fitness:
-                best_fitness = self.fi
+            if self.fi > self.best_fitness:
+                self.best_fitness = self.fi
             log_vals = list(self.mloss) + list(results) + self.lr
-            self.callbacks.run('on_fit_epoch_end', log_vals, epoch, best_fitness, self.fi)
+            self.callbacks.run('on_fit_epoch_end', log_vals, epoch, self.best_fitness, self.fi)
 
             # Save model
             if (not self.nosave) or (final_epoch and not self.evolve):  # if save
                 ckpt = {'epoch': epoch,
-                        'best_fitness': best_fitness,
+                        'best_fitness': self.best_fitness,
                         'model': deepcopy(de_parallel(model)).half(),
                         'ema': deepcopy(self.ema.ema).half(),
                         'updates': self.ema.updates,
@@ -227,12 +227,12 @@ class Train():
 
                 # Save last, best and delete
                 torch.save(ckpt, self.last)
-                if best_fitness == self.fi:
+                if self.best_fitness == self.fi:
                     torch.save(ckpt, self.best)
                 if (epoch > 0) and (opt.save_period > 0) and (epoch % opt.save_period == 0):
                     torch.save(ckpt, self.w / f'epoch{epoch}.pt')
                 del ckpt
-                self.callbacks.run('on_model_save', self.last, epoch, final_epoch, best_fitness, self.fi)
+                self.callbacks.run('on_model_save', self.last, epoch, final_epoch, self.best_fitness, self.fi)
 
             # Stop Single-GPU
             if RANK == -1 and self.stopper(epoch=epoch, fitness=self.fi):
@@ -327,10 +327,10 @@ class Train():
             model = Model(self.cfg, ch=3, nc=self.nc, anchors=self.hyp.get('anchors')).to(self.device)  # create
             
         # Freeze
-        freeze = [f'model.{x}.' for x in (freeze if len(freeze) > 1 else range(freeze[0]))]  # layers to freeze
+        self.freeze = [f'model.{x}.' for x in (self.freeze if len(self.freeze) > 1 else range(self.freeze[0]))]  # layers to freeze
         for k, v in model.named_parameters():
             v.requires_grad = True  # train all layers
-            if any(x in k for x in freeze):
+            if any(x in k for x in self.freeze):
                 LOGGER.info(f'freezing {k}')
                 v.requires_grad = False
 
@@ -339,14 +339,14 @@ class Train():
         self.imgsz = check_img_size(self.opt.imgsz, self.gs, floor=self.gs * 2)  # verify imgsz is gs-multiple
 
         # Batch size
-        if RANK == -1 and batch_size == -1:  # single-GPU only, estimate best batch size
-            batch_size = check_train_batch_size(model, self.imgsz)
-            self.loggers.on_params_update({"batch_size": batch_size})
+        if RANK == -1 and self.batch_size == -1:  # single-GPU only, estimate best batch size
+            self.batch_size = check_train_batch_size(model, self.imgsz)
+            self.loggers.on_params_update({"batch_size": self.batch_size})
 
         # Optimizer
         self.nbs = 64  # nominal batch size
-        accumulate = max(round(self.nbs / batch_size), 1)  # accumulate loss before optimizing
-        self.hyp['weight_decay'] *= batch_size * accumulate / self.nbs  # scale weight_decay
+        self.accumulate = max(round(self.nbs / self.batch_size), 1)  # accumulate loss before optimizing
+        self.hyp['weight_decay'] *= self.batch_size * self.accumulate / self.nbs  # scale weight_decay
         LOGGER.info(f"Scaled weight_decay = {self.hyp['weight_decay']}")
 
         g0, g1, g2 = [], [], []  # optimizer parameter groups
@@ -373,9 +373,9 @@ class Train():
 
         # Scheduler
         if self.opt.linear_lr:
-            self.lf = lambda x: (1 - x / (epochs - 1)) * (1.0 - self.hyp['lrf']) + self.hyp['lrf']  # linear
+            self.lf = lambda x: (1 - x / (self.epochs - 1)) * (1.0 - self.hyp['lrf']) + self.hyp['lrf']  # linear
         else:
-            self.lf = one_cycle(1, self.hyp['lrf'], epochs)  # cosine 1->hyp['lrf']
+            self.lf = one_cycle(1, self.hyp['lrf'], self.epochs)  # cosine 1->hyp['lrf']
         self.scheduler = lr_scheduler.LambdaLR(self.optimizer, lr_lambda=self.lf)  # plot_lr_scheduler(optimizer, scheduler, epochs)
 
         # EMA
@@ -383,11 +383,11 @@ class Train():
 
         # Resume
         self.start_epoch, self.best_fitness = 0, 0.0
-        if self.weights.endswith('.pt'):
+        if pretrained:
             # Optimizer
             if ckpt['optimizer'] is not None:
                 self.optimizer.load_state_dict(ckpt['optimizer'])
-                best_fitness = ckpt['best_fitness']
+                self.best_fitness = ckpt['best_fitness']
 
             # EMA
             if self.ema and ckpt.get('ema'):
@@ -397,10 +397,10 @@ class Train():
             # Epochs
             self.start_epoch = ckpt['epoch'] + 1
             if self.resume:
-                assert self.start_epoch > 0, f'{self.weights} training to {epochs} epochs is finished, nothing to resume.'
-            if epochs < self.start_epoch:
-                LOGGER.info(f"{self.weights} has been trained for {ckpt['epoch']} epochs. Fine-tuning for {epochs} more epochs.")
-                epochs += ckpt['epoch']  # finetune additional epochs
+                assert self.start_epoch > 0, f'{self.weights} training to {self.epochs} epochs is finished, nothing to resume.'
+            if self.epochs < self.start_epoch:
+                LOGGER.info(f"{self.weights} has been trained for {ckpt['epoch']} epochs. Fine-tuning for {self.epochs} more epochs.")
+                self.epochs += ckpt['epoch']  # finetune additional epochs
 
             del ckpt, csd
 
@@ -416,7 +416,7 @@ class Train():
             LOGGER.info('Using SyncBatchNorm()')
 
         # Trainloader
-        self.train_loader, self.dataset = create_dataloader(self.train_path, self.imgsz, batch_size // WORLD_SIZE, self.gs, self.single_cls,
+        self.train_loader, self.dataset = create_dataloader(self.train_path, self.imgsz, self.batch_size // WORLD_SIZE, self.gs, self.single_cls,
                                                 hyp=self.hyp, augment=True, cache=self.opt.cache, rect=self.opt.rect, rank=LOCAL_RANK,
                                                 workers=self.workers, image_weights=self.opt.image_weights, quad=self.opt.quad,
                                                 prefix=colorstr('train: '), shuffle=True)
@@ -426,7 +426,7 @@ class Train():
 
         # Process 0
         if RANK in [-1, 0]:
-            self.val_loader = create_dataloader(self.val_path, self.imgsz, batch_size // WORLD_SIZE * 2, self.gs, self.single_cls,
+            self.val_loader = create_dataloader(self.val_path, self.imgsz, self.batch_size // WORLD_SIZE * 2, self.gs, self.single_cls,
                                         hyp=self.hyp, cache=None if self.noval else self.opt.cache, rect=True, rank=-1,
                                         workers=self.workers, pad=0.5,
                                         prefix=colorstr('val: '))[0]
