@@ -3,5 +3,4 @@ __pycache__
 data/
 Detection/datasets
 Detection/YOLO/runs
-
-
+Detection/YOLO/logs
