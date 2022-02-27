@@ -20,8 +20,8 @@ def UNET_DataLoader(img_dir, mask_dir, batch_size, img_size, split_ratio=0):
         A.Resize(width=img_size, height=img_size)
     ])
 
-    # dataset = UNET_Dataset(img_dir, mask_dir, transform)
-    dataset = Nucleus_Dataset(img_dir, transform)
+    dataset = UNET_Dataset(img_dir, mask_dir, transform)
+    # dataset = Nucleus_Dataset(img_dir, transform)
     if split_ratio==False:
         ds_sampler = torch.utils.data.RandomSampler(dataset)
         batch_sampler = torch.utils.data.BatchSampler(ds_sampler, batch_size, drop_last=False)
