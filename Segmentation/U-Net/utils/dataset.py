@@ -48,7 +48,7 @@ class UNET_Dataset(Dataset):
     Define img_paths, mask_paths based on dataset
         - each paths 
     """
-    def __init__(self, img_dir, mask_dir, transform=None, rgb=False):
+    def __init__(self, img_dir, mask_dir, transform=None, rgb=True):
         self.img_dir = img_dir
         self.mask_dir = mask_dir
         self.transfrom = transform
