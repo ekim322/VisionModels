@@ -177,7 +177,7 @@ if __name__=='__main__':
         dataset = UNET_Dataset(cfg['train_img_dir'], cfg['train_mask_dir'])
         num_classes = dataset.get_num_classes()
     in_channels = 3 if cfg['img_rgb'] else 1
- 
+
     model = UNet(n_channels=in_channels, n_classes=num_classes)
     if check_config_key(cfg, 'model_load_path'):
         model.load_state_dict(torch.load(cfg['model_load_path']))
