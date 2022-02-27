@@ -8,7 +8,7 @@ batch_accum: 8
 patience: 30
 
 img_size: 512
-img_rgb: False
+img_rgb: True
 
 train_img_dir: '../../../cityscapes_data/leftImg8bit/my_train'
 val_img_dir: '../../../cityscapes_data/leftImg8bit/my_val'
@@ -21,5 +21,5 @@ test_mask_dir:
 model_save_dir: 'saved_weight'
 model_load_path: 
 
-num_classes: 12
+num_classes: 11
 mixed_precision: True

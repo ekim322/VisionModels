@@ -123,8 +123,8 @@ def train_model(model, cfg):
         betas = (0.9, 0.999),
         weight_decay=cfg['wd']
     )
-    # loss_fn = torch.nn.CrossEntropyLoss()
-    loss_fn = torch.nn.BCEWithLogitsLoss()
+    loss_fn = torch.nn.CrossEntropyLoss()
+#     loss_fn = torch.nn.BCEWithLogitsLoss()
     writer = SummaryWriter(os.path.join('logs', cfg['exp_name']))
     grad_scaler = torch.cuda.amp.GradScaler()
 
@@ -177,7 +177,7 @@ if __name__=='__main__':
         dataset = UNET_Dataset(cfg['train_img_dir'], cfg['train_mask_dir'])
         num_classes = dataset.get_num_classes()
     in_channels = 3 if cfg['img_rgb'] else 1
-
+ 
     model = UNet(n_channels=in_channels, n_classes=num_classes)
     if check_config_key(cfg, 'model_load_path'):
         model.load_state_dict(torch.load(cfg['model_load_path']))
