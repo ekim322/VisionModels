@@ -14,12 +14,12 @@ train_img_dir: '../../../cityscapes_data/leftImg8bit/my_train'
 val_img_dir: '../../../cityscapes_data/leftImg8bit/my_val'
 test_img_dir: 
 
-train_mask_dir: '../../../cityscapes_data/gtFine/my_train'
-val_mask_dir: '../../../cityscapes_data/gtFine/my_val'
+train_mask_dir: '../../../cityscapes_data/gtCoarse/my_train'
+val_mask_dir: '../../../cityscapes_data/gtCoarse/my_val'
 test_mask_dir: 
 
 model_save_dir: 'saved_weight'
-model_load_path: 
+model_load_path: 'saved_weight/cityscapes2_train.pt'
 
-num_classes: 12
+num_classes: 4
 mixed_precision: True
