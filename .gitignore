@@ -4,5 +4,5 @@ data/
 Detection/datasets
 Detection/YOLO/runs
 Detection/YOLO/logs
-Segmentation/U-net/logs
-Segmentation/U-net/saved_weight
+Segmentation/U-Net/logs
+Segmentation/U-Net/saved_weight
