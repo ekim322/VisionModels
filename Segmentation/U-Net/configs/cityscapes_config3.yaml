@@ -19,7 +19,7 @@ val_mask_dir: '../../../cityscapes_data/gtCoarse/my_val'
 test_mask_dir: 
 
 model_save_dir: 'saved_weight'
-model_load_path: 
+model_load_path: 'saved_weight/cityscapes3_val.pt'
 
 num_classes: 3
 mixed_precision: True

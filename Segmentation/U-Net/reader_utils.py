@@ -6,8 +6,8 @@ import matplotlib.pyplot as plt
 
 from model.unet import UNet
 
-model_path = 'saved_weight/cityscapes2_val.pt'
-class_keys = {'road': 0, 'wall': 1, 'car': 2, 'bg': 3}
+model_path = 'saved_weight/cityscapes3_val.pt'
+class_keys = {'bg': 0, 'road': 1, 'car': 2}
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
@@ -55,7 +55,7 @@ def detect_img(image, model):
 #     ticks = filter_class(mask, 1)
 #     ticks_clean = clean_mask(ticks)
 
-    cars = filter_class(mask, 0)
+    cars = filter_class(mask, 2)
 
 #     needle = filter_class(mask, 3)
 #     needle_clean = clean_mask(needle)
