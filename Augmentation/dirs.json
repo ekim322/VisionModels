@@ -1,0 +1,6 @@
+{
+    "train_imgs_dir": "../../cityscapes_data/leftImg8bit/my_train/",
+    "val_imgs_dir": "../../cityscapes_data/leftImg8bit/my_val/",
+    "train_mask_dir": "../../cityscapes_data/gtCoarse/my_train/",
+    "val_mask_dir": "../../cityscapes_data/gtCoarse/my_val/"
+}

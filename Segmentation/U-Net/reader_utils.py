@@ -55,7 +55,7 @@ def detect_img(image, model):
 #     ticks = filter_class(mask, 1)
 #     ticks_clean = clean_mask(ticks)
 
-    cars = filter_class(mask, 2)
+    cars = filter_class(mask, 1)
 
 #     needle = filter_class(mask, 3)
 #     needle_clean = clean_mask(needle)
