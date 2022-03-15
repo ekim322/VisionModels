@@ -137,7 +137,7 @@ class UNET_Dataset(Dataset):
             image = np.array(Image.open(img_path).convert("L"))
             image = np.expand_dims(image, axis=-1)
         mask = np.array(Image.open(mask_path).convert("L"), dtype=np.float32) # Gray scale
-        image = image/np.max(image)
+#         image = image/np.max(image)
         if len(np.unique(mask))==2:
             mask = mask/np.max(mask)
 
