@@ -101,7 +101,7 @@ def train_model(model, cfg):
     # Load train/val dataset
     if check_config_key(cfg, 'val_img_dir'): # If validation set exists
         train_dataloader = UNET_DataLoader(cfg['train_img_dir'], cfg['train_mask_dir'], cfg['batch_size'], cfg['img_size'])
-        val_dataloader = UNET_DataLoader(cfg['val_img_dir'], cfg['val_mask_dir'], cfg['batch_size'], cfg['img_size'])
+        val_dataloader = UNET_DataLoader(cfg['val_img_dir'], cfg['val_mask_dir'], cfg['batch_size'], cfg['img_size'], "val")
     else: # Split train set  to train/val
         print("Splitting training and validation set")
         train_dataloader, val_dataloader = UNET_DataLoader(cfg['train_img_dir'], cfg['train_mask_dir'], cfg['batch_size'], cfg['img_size'], split_ratio=0.1)

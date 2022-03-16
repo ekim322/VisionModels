@@ -11,7 +11,7 @@ import albumentations as A
 
 from utils.utils_fn import np_to_tensor
 
-def UNET_DataLoader(img_dir, mask_dir, batch_size, img_size, split_ratio=0):
+def UNET_DataLoader(img_dir, mask_dir, batch_size, img_size, type="train", split_ratio=0):
     """
     If split ratio is 0 - return dataset 
     Else - split train/val
@@ -54,15 +54,14 @@ def UNET_DataLoader(img_dir, mask_dir, batch_size, img_size, split_ratio=0):
             A.RandomSnow(p=0.1), 
             A.RandomSunFlare(p=0.1)]
 
-    transform = A.Compose([
-        A.Resize(width=img_size, height=img_size),
-        np.random.choice(type1), 
-        np.random.choice(type2), 
-        np.random.choice(type3),
-        np.random.choice(type4), 
-        np.random.choice(type5), 
-        np.random.choice(type6)
-    ])
+    if type == 'train':
+        transform = A.Compose([
+            A.Resize(width=img_size, height=img_size),
+            *type1, *type2, *type3, *type4, *type5, *type6
+        ])
+    
+    if type == 'val':
+        transform = A.Compose([A.Resize(width=img_size, height=img_size)])
 
     dataset = UNET_Dataset(img_dir, mask_dir, transform)
     # dataset = Nucleus_Dataset(img_dir, transform)
